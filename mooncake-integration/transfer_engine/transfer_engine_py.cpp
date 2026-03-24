@@ -201,8 +201,25 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool manual_transport = requiresManualTransportInstall(proto);
-    engine_ =
-        std::make_unique<TransferEngine>(!manual_transport, device_filter);
+
+#ifdef USE_EFA
+    // When using EFA protocol, we still need topology discovery but won't
+    // auto-install RDMA
+    bool use_efa = (proto == "efa");
+    // Disable auto_discover to prevent RDMA transport installation, we'll
+    // install EFA or advanced transports manually
+    engine_ = std::make_unique<TransferEngine>(false, device_filter);
+    // Manually discover topology for EFA to populate device list
+    if (use_efa) {
+        engine_->getLocalTopology()->discover(device_filter);
+        LOG(INFO) << "Topology discovery complete for EFA. Found "
+                  << engine_->getLocalTopology()->getHcaList().size()
+                  << " devices.";
+    }
+#else
+    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+#endif
+
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -215,6 +232,36 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         if (ret) return -1;
     }
 
+#ifdef USE_EFA
+    if (use_efa) {
+        LOG(INFO)
+            << "Installing EFA transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("efa", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install EFA transport";
+            return -1;
+        }
+        LOG(INFO) << "EFA transport installed successfully";
+    } else if (manual_transport) {
+        auto *transport = engine_->installTransport(proto.c_str(), nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install transport: " << proto;
+            return -1;
+        }
+    } else {
+        // For non-EFA protocols (e.g. TCP), manually install TCP transport
+        // since auto_discover is disabled to prevent RDMA installation
+        // (RDMA QP creation fails on EFA devices).
+        LOG(INFO)
+            << "Installing TCP transport (auto_discover disabled in EFA build)";
+        auto transport = engine_->installTransport("tcp", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install TCP transport";
+            return -1;
+        }
+        LOG(INFO) << "TCP transport installed successfully";
+    }
+#else
     if (manual_transport) {
         auto *transport = engine_->installTransport(proto.c_str(), nullptr);
         if (!transport) {
@@ -222,6 +269,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             return -1;
         }
     }
+#endif
 
     free_list_.resize(kSlabSizeKBTabLen);
     return 0;

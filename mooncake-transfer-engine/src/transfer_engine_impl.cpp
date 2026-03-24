@@ -201,6 +201,16 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #else
 
+#ifdef USE_UBSHMEM
+    Transport* ubshmem_transport =
+        multi_transports_->installTransport("ubshmem", local_topology_);
+    if (!ubshmem_transport) {
+        LOG(ERROR) << "Failed to install UBShmem transport";
+        return -1;
+    }
+    auto_discover_ = false;
+#endif
+
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
@@ -243,24 +253,8 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
-#if defined(USE_HIP)
-        const char* cross_node_transport = "hip";
-        const char* cross_node_transport_name = "HIP";
-#else
-        const char* cross_node_transport = "nvlink";
-        const char* cross_node_transport_name = "NVLink";
-#endif
-        if (force_mnnvl || local_topology_->getHcaList().empty()) {
-            Transport* t = multi_transports_->installTransport(
-                cross_node_transport, nullptr);
-            if (!t) {
-                LOG(ERROR) << "Failed to install " << cross_node_transport_name
-                           << " transport";
-                return -1;
-            }
-            LOG(INFO) << "Using cross-node " << cross_node_transport_name
-                      << " transport (MC_FORCE_MNNVL or no HCA detected)";
-        } else if (intra_env) {
+        // Explicit env var overrides take priority over HCA auto-detection
+        if (intra_env) {
             Transport* t =
                 multi_transports_->installTransport("nvlink_intra", nullptr);
             if (!t) {
@@ -269,6 +263,24 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
+        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+#if defined(USE_HIP)
+            constexpr const char* kCrossNodeTransport = "hip";
+            constexpr const char* kCrossNodeTransportName = "HIP";
+#else
+            constexpr const char* kCrossNodeTransport = "nvlink";
+            constexpr const char* kCrossNodeTransportName = "NVLink";
+#endif
+            Transport* t =
+                multi_transports_->installTransport(kCrossNodeTransport, nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install " << kCrossNodeTransportName
+                           << " transport";
+                return -1;
+            }
+            LOG(INFO) << "Using cross-node " << kCrossNodeTransportName
+                      << " transport "
+                      << "(MC_FORCE_MNNVL or no HCA detected)";
         } else {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);

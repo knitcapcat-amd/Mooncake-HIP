@@ -51,6 +51,9 @@
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
 
 #include <cassert>
 
@@ -270,7 +273,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
-#endif
+#endif  // USE_MNNVL
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();
@@ -279,6 +282,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_UBSHMEM
     else if (std::string(proto) == "ubshmem") {
         transport = new UBShmemTransport();
+    }
+#endif
+#ifdef USE_EFA
+    else if (std::string(proto) == "efa") {
+        transport = new EfaTransport();
     }
 #endif
 
