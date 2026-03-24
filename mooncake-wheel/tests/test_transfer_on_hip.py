@@ -27,9 +27,7 @@ class TestTransferOnHip(unittest.TestCase):
         cls.local_hostname = get_ip()
         ret = cls.engine.initialize(cls.local_hostname, "P2PHANDSHAKE", "hip", "")
         if ret != 0:
-            raise unittest.SkipTest(
-                f"Failed to initialize HIP transport (code {ret})"
-            )
+            raise unittest.SkipTest(f"Failed to initialize HIP transport (code {ret})")
 
         if ":" in cls.local_hostname:
             cls.target_name = f"[{cls.local_hostname}]:{cls.engine.get_rpc_port()}"
@@ -84,5 +82,5 @@ class TestTransferOnHip(unittest.TestCase):
         self.assertTrue(torch.all(self.src_tensor == 77))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

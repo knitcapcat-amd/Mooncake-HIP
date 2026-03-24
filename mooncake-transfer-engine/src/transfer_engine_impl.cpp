@@ -251,11 +251,11 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         const char* cross_node_transport_name = "NVLink";
 #endif
         if (force_mnnvl || local_topology_->getHcaList().empty()) {
-            Transport* t =
-                multi_transports_->installTransport(cross_node_transport, nullptr);
+            Transport* t = multi_transports_->installTransport(
+                cross_node_transport, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install "
-                           << cross_node_transport_name << " transport";
+                LOG(ERROR) << "Failed to install " << cross_node_transport_name
+                           << " transport";
                 return -1;
             }
             LOG(INFO) << "Using cross-node " << cross_node_transport_name
