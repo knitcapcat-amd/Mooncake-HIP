@@ -21,6 +21,10 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#endif
+
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
@@ -37,6 +41,19 @@ static void *(*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void *) = nullptr;
 static std::string g_protocol;
 
+static std::string normalizeTransportProtocol(const char *protocol) {
+    if (!protocol) return "";
+
+    std::string normalized(protocol);
+    if (normalized == "xgmi") normalized = "hip";
+    return normalized;
+}
+
+static bool requiresManualTransportInstall(const std::string &protocol) {
+    return protocol == "hip" || protocol == "nvlink" ||
+           protocol == "nvlink_intra";
+}
+
 //  Handle allocateMemory function pointer based on protocol
 void initMemoryAllocator(const char *protocol) {
     if (allocateMemory != nullptr) {
@@ -44,8 +61,9 @@ void initMemoryAllocator(const char *protocol) {
                      << g_protocol;
         return;
     }
-    g_protocol = protocol;
-    if (strcmp(protocol, "nvlink") == 0) {
+    auto normalized_protocol = normalizeTransportProtocol(protocol);
+    g_protocol = normalized_protocol;
+    if (normalized_protocol == "nvlink") {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void * {
             return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
@@ -55,9 +73,25 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
+        allocateMemory = malloc;
+        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
-    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+    } else if (normalized_protocol == "hip") {
+#ifdef USE_HIP
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::HipTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::HipTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected HIP memory allocator";
+#else
+        allocateMemory = malloc;
+        freeMemory = free;
+        LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+#endif
+    } else if (normalized_protocol == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
         allocateMemory = [](size_t s) -> void * {
             return mooncake::IntraNodeNvlinkTransport::
@@ -68,13 +102,16 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
+        allocateMemory = malloc;
+        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
 #endif
     } else {
         // default fallback
         allocateMemory = malloc;
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using default malloc/free for protocol: "
+                     << normalized_protocol;
     }
 }
 
@@ -158,30 +195,13 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *protocol,
                                     const char *device_name,
                                     const char *metadata_type) {
-    std::string proto = protocol ? std::string(protocol) : "";
+    std::string proto = normalizeTransportProtocol(protocol);
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
-
-#ifdef USE_EFA
-    // When using EFA protocol, we still need topology discovery but won't
-    // auto-install RDMA
-    bool use_efa = (proto == "efa");
-    // Disable auto_discover to prevent RDMA transport installation, we'll
-    // install EFA manually
-    engine_ = std::make_unique<TransferEngine>(false, device_filter);
-    // Manually discover topology for EFA to populate device list
-    if (use_efa) {
-        engine_->getLocalTopology()->discover(device_filter);
-        LOG(INFO) << "Topology discovery complete for EFA. Found "
-                  << engine_->getLocalTopology()->getHcaList().size()
-                  << " devices.";
-    }
-#else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
-#endif
-
+    bool manual_transport = requiresManualTransportInstall(proto);
+    engine_ = std::make_unique<TransferEngine>(!manual_transport, device_filter);
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
         int ret =
@@ -194,31 +214,13 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         if (ret) return -1;
     }
 
-#ifdef USE_EFA
-    // Install EFA transport when protocol is "efa"
-    if (use_efa) {
-        LOG(INFO)
-            << "Installing EFA transport as requested by protocol parameter";
-        auto transport = engine_->installTransport("efa", nullptr);
+    if (manual_transport) {
+        auto *transport = engine_->installTransport(proto.c_str(), nullptr);
         if (!transport) {
-            LOG(ERROR) << "Failed to install EFA transport";
+            LOG(ERROR) << "Failed to install transport: " << proto;
             return -1;
         }
-        LOG(INFO) << "EFA transport installed successfully";
-    } else {
-        // For non-EFA protocols (e.g. TCP), manually install TCP transport
-        // since auto_discover is disabled to prevent RDMA installation
-        // (RDMA QP creation fails on EFA devices).
-        LOG(INFO)
-            << "Installing TCP transport (auto_discover disabled in EFA build)";
-        auto transport = engine_->installTransport("tcp", nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install TCP transport";
-            return -1;
-        }
-        LOG(INFO) << "TCP transport installed successfully";
     }
-#endif
 
     free_list_.resize(kSlabSizeKBTabLen);
     return 0;
