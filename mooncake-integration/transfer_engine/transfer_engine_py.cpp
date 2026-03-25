@@ -21,6 +21,10 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#endif
+
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
@@ -44,8 +48,9 @@ void initMemoryAllocator(const char *protocol) {
                      << g_protocol;
         return;
     }
-    g_protocol = protocol;
-    if (strcmp(protocol, "nvlink") == 0) {
+    std::string proto = protocol ? std::string(protocol) : "";
+    g_protocol = proto;
+    if (proto == "nvlink") {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void * {
             return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
@@ -55,9 +60,30 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
+        allocateMemory = malloc;
+        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
-    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+    } else if (proto == "xgmi") {
+#ifdef USE_HIP
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::HipTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::HipTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected XGMI (HIP) memory allocator";
+#else
+        allocateMemory = malloc;
+        freeMemory = free;
+        LOG(ERROR) << "Protocol 'xgmi' requires -DUSE_HIP=ON";
+#endif
+    } else if (proto == "hip") {
+        allocateMemory = malloc;
+        freeMemory = free;
+        LOG(ERROR) << "Protocol 'hip' is not exposed in the Python API. "
+                   << "Use 'xgmi' instead.";
+    } else if (proto == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
         allocateMemory = [](size_t s) -> void * {
             return mooncake::IntraNodeNvlinkTransport::
@@ -68,13 +94,16 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
+        allocateMemory = malloc;
+        freeMemory = free;
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
 #endif
     } else {
         // default fallback
         allocateMemory = malloc;
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using default malloc/free for protocol: "
+                     << proto;
     }
 }
 
@@ -159,17 +188,27 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                                     const char *device_name,
                                     const char *metadata_type) {
     std::string proto = protocol ? std::string(protocol) : "";
+    if (proto == "hip") {
+        LOG(ERROR) << "Protocol 'hip' is not exposed in the Python API. "
+                   << "Use 'xgmi' instead.";
+        return -1;
+    }
+
+    const bool use_xgmi = (proto == "xgmi");
+    const char *transport_name = use_xgmi ? "hip" : proto.c_str();
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
+    bool manual_transport =
+        use_xgmi || proto == "nvlink" || proto == "nvlink_intra";
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
     // auto-install RDMA
     bool use_efa = (proto == "efa");
     // Disable auto_discover to prevent RDMA transport installation, we'll
-    // install EFA manually
+    // install EFA or advanced transports manually
     engine_ = std::make_unique<TransferEngine>(false, device_filter);
     // Manually discover topology for EFA to populate device list
     if (use_efa) {
@@ -179,7 +218,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!manual_transport, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -195,7 +234,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
 #ifdef USE_EFA
-    // Install EFA transport when protocol is "efa"
     if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
@@ -205,6 +243,12 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
+    } else if (manual_transport) {
+        auto *transport = engine_->installTransport(transport_name, nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install transport: " << transport_name;
+            return -1;
+        }
     } else {
         // For non-EFA protocols (e.g. TCP), manually install TCP transport
         // since auto_discover is disabled to prevent RDMA installation
@@ -217,6 +261,14 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             return -1;
         }
         LOG(INFO) << "TCP transport installed successfully";
+    }
+#else
+    if (manual_transport) {
+        auto *transport = engine_->installTransport(transport_name, nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install transport: " << transport_name;
+            return -1;
+        }
     }
 #endif
 
